@@ -1,0 +1,30 @@
+[project]
+name = "sam3m"
+version = "0.1.0"
+description = "SAM3 fine-tuning for CellMap 3D EM organelle segmentation"
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+setuptools = "<72"
+
+[pypi-dependencies]
+sam3m = { path = ".", editable = true }
+sam3 = { git = "https://github.com/facebookresearch/sam3.git", extras = ["train"] }
+decord = "*"
+iopath = ">=0.1.10"
+ftfy = "==6.1.1"
+regex = "*"
+huggingface-hub = "*"
+pycocotools = "*"
+opencv-python = "*"
+pandas = "*"
+psutil = "*"
+
+[tasks]
+train = "python scripts/train.py"
+evaluate = "python scripts/evaluate.py"
+test = "pytest tests/ -v"
+prepare-data = "python scripts/prepare_data.py"

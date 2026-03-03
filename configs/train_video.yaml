@@ -1,0 +1,87 @@
+# SAM3 CellMap Video Mode Training Config
+# Primary configuration for fine-tuning SAM3 on CellMap EM data
+
+model:
+  sam3_checkpoint: null  # uses default SAM3 checkpoint (requires HF auth)
+  lora:
+    rank: 8
+    alpha: 8.0
+    dropout: 0.05
+    targets: ["attn.qkv", "attn.proj"]
+  heads:
+    n_fine: 48
+    n_medium: 17
+    n_coarse: 7
+    hidden_channels: 128
+    use_auxiliary: true
+
+data:
+  data_root: /nrs/cellmap/data
+  norms_csv: configs/norms.csv
+  target_resolution: 8.0  # nm
+  patch_size: [128, 128, 128]
+  num_frames: 16
+  frame_stride: 8
+  image_size: 1008
+  mask_size: 256
+  samples_per_epoch: 2000
+  skip_datasets:
+    - jrc_c-elegans-P3_E5_D1_N2  # broken zarr
+
+augmentation:
+  spatial_prob: 0.5
+  intensity_prob: 0.3
+  noise_std: 0.03
+  brightness_range: [0.9, 1.1]
+  contrast_range: [0.8, 1.2]
+
+training:
+  batch_size: 1  # per GPU (16 frames x 1008x1008 is memory-heavy)
+  num_workers: 8
+  prefetch_factor: 4
+  lr: 2.0e-4  # higher for LoRA (fewer params)
+  weight_decay: 0.01
+  max_epochs: 200
+  balanced_sampling: true
+
+  # Optimizer
+  optimizer: AdamW
+  betas: [0.9, 0.999]
+
+  # Scheduler: cosine with warmup + restarts
+  scheduler: CosineAnnealingWarmRestarts
+  warmup_epochs: 5
+  T_0: 50
+  T_mult: 2
+  eta_min: 1.0e-6
+
+  # Mixed precision & gradient accumulation
+  use_amp: true
+  accumulation_steps: 8  # effective batch = batch_size * num_gpus * accumulation
+
+  # Loss
+  loss:
+    bce_weight: 0.5
+    dice_weight: 0.5
+    boundary_weight: 5.0
+    boundary_loss_weight: 0.1
+    dynamic_weights: true
+    z_consistency_weight: 0.1
+
+  # Validation
+  val_fraction: 0.1
+  val_every_n_epochs: 5
+
+  # Checkpointing
+  checkpoint_dir: checkpoints/video_lora
+  save_every_n_epochs: 10
+  early_stopping_patience: 50
+
+  # Multi-GPU
+  num_gpus: 8
+  distributed_backend: nccl
+
+logging:
+  wandb_project: sam3m-cellmap
+  wandb_run_name: null  # auto-generated
+  log_every_n_steps: 10

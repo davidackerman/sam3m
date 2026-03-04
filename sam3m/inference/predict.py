@@ -1,7 +1,7 @@
-"""Inference pipeline: sliding window + video propagation.
+"""Inference pipeline: sliding window z-stack prediction.
 
 Processes full 3D EM volumes using overlapping sliding windows.
-Each window is processed as a pseudo-video (z-slices as frames)
+Each window is processed as a z-stack (z-slices as frames)
 with optional bidirectional propagation for z-consistency.
 
 Output: [48, Z, Y, X] probability maps for the full volume.
@@ -56,7 +56,7 @@ def predict_volume(
     device: str = "cuda",
     bidirectional: bool = True,
 ) -> np.ndarray:
-    """Predict on a full 3D volume using sliding window + video mode.
+    """Predict on a full 3D volume using sliding window.
 
     Args:
         model: Trained SAM3CellMapModel.
@@ -64,8 +64,8 @@ def predict_volume(
         norm_fn: Optional function to normalize raw values to [0, 1].
         patch_size: 3D patch size for sliding window.
         stride: Stride between patches (< patch_size for overlap).
-        num_frames: Z-slices per video.
-        frame_stride: Stride between z-slices in video.
+        num_frames: Z-slices per z-stack.
+        frame_stride: Stride between z-slices.
         image_size: SAM3 input resolution.
         n_classes: Number of output classes.
         device: CUDA device.
@@ -139,7 +139,7 @@ def _predict_patch(
     device: str,
     bidirectional: bool,
 ) -> np.ndarray:
-    """Predict on a single 3D patch using video mode.
+    """Predict on a single 3D patch.
 
     Args:
         patch: [D, H, W] float32 normalized EM patch.
@@ -194,7 +194,7 @@ def _predict_patch(
 
 
 def _select_z_indices(depth, num_frames, frame_stride):
-    """Select z-slice indices (same logic as video_dataset)."""
+    """Select z-slice indices (same logic as zstack_dataset)."""
     max_frames = min(num_frames, depth)
     stride = frame_stride
     while max_frames * stride > depth and stride > 1:

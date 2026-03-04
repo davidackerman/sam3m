@@ -584,12 +584,29 @@ class CellMapDataset3D(Dataset):
             ])
 
         # --- Read raw (always full patch, never padded black) ---
+        # Pick the best zarr pyramid level for the effective resolution.
+        # At scale_factor=1 this is the base 8nm level; at scale_factor=4
+        # it finds the ~32nm level so we read ~128³ voxels instead of ~512³.
+        raw_scale_path = crop.raw_scale_path
         raw_res = np.array(crop.raw_resolution)
         raw_off = np.array(crop.raw_offset_world)
         raw_shape = np.array(crop.raw_shape)
 
+        if scale_factor > 1.0:
+            effective_target_res = self.target_resolution * scale_factor
+            raw_scale_info = find_scale_for_resolution(
+                crop.raw_zarr_path, effective_target_res
+            )
+            if raw_scale_info is not None:
+                raw_scale_path = raw_scale_info[0]
+                raw_res = np.array(raw_scale_info[1])
+                raw_off = np.array(raw_scale_info[2])
+                raw_shape = np.array(raw_scale_info[3])
+
         # How many raw voxels cover the target world extent per axis
         raw_read_vox = np.ceil(patch_world / raw_res).astype(int)
+        # Clamp to volume size (scale_factor may request more than available)
+        raw_read_vox = np.minimum(raw_read_vox, raw_shape)
 
         raw_start_vox = np.round((sample_origin - raw_off) / raw_res).astype(int)
         # Clamp so the full read window stays within the raw volume
@@ -601,7 +618,7 @@ class CellMapDataset3D(Dataset):
         sample_origin = raw_off + raw_start_vox * raw_res
 
         raw_arr = zarr.open(
-            os.path.join(crop.raw_zarr_path, crop.raw_scale_path), mode="r"
+            os.path.join(crop.raw_zarr_path, raw_scale_path), mode="r"
         )
         raw_patch = np.array(
             raw_arr[
@@ -660,8 +677,21 @@ class CellMapDataset3D(Dataset):
             annotated_mask[cls_idx] = True
 
             ci = crop.class_info[cls_name]
+            cls_scale_path = ci.scale_path
             cls_res = np.array(ci.resolution)
             cls_off = np.array(ci.offset_world)
+            cls_shape = np.array(ci.shape)
+
+            # Use coarser label pyramid level when available
+            if scale_factor > 1.0:
+                label_scale_info = find_scale_for_resolution(
+                    ci.zarr_path, effective_target_res
+                )
+                if label_scale_info is not None:
+                    cls_scale_path = label_scale_info[0]
+                    cls_res = np.array(label_scale_info[1])
+                    cls_off = np.array(label_scale_info[2])
+                    cls_shape = np.array(label_scale_info[3])
 
             # How many class voxels cover the target world extent
             cls_patch_vox = np.ceil(patch_world / cls_res).astype(int)
@@ -671,7 +701,6 @@ class CellMapDataset3D(Dataset):
             cls_start_vox = np.maximum(cls_start_vox, 0)
 
             # Clip to label array bounds
-            cls_shape = np.array(ci.shape)
             cls_end_vox = np.minimum(cls_start_vox + cls_patch_vox, cls_shape)
             cls_read_size = cls_end_vox - cls_start_vox
 
@@ -680,7 +709,7 @@ class CellMapDataset3D(Dataset):
 
             try:
                 label_arr = zarr.open(
-                    os.path.join(ci.zarr_path, ci.scale_path), mode="r"
+                    os.path.join(ci.zarr_path, cls_scale_path), mode="r"
                 )
                 label_patch = np.array(
                     label_arr[

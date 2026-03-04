@@ -1,13 +1,12 @@
-"""Video dataset wrapper for SAM3 training.
+"""Z-stack dataset wrapper for SAM3 training.
 
-Wraps CellMapDataset3D to produce z-stack sequences as pseudo-video
-for SAM3's video predictor. Each 3D patch becomes a sequence of 2D
-z-slices treated as video frames.
+Wraps CellMapDataset3D to produce z-stack sequences for SAM3 training.
+Each 3D patch becomes a sequence of 2D z-slices treated as frames.
 
 Key design decisions:
 - num_frames=16 with frame_stride=8 covers a full 128-voxel depth patch
 - image_size=1008 matches SAM3's ViT input expectation (14px patches -> 72x72 grid)
-- Grayscale EM images are repeated to 3 channels for RGB-pretrained ViT
+- Adjacent z-slices [z-1, z, z+1] are used as RGB channels for 3D context
 - Labels are resized with nearest-neighbor to avoid interpolation artifacts
 """
 
@@ -26,15 +25,14 @@ from .dataset import CellMapDataset3D
 logger = logging.getLogger(__name__)
 
 
-class CellMapVideoDataset(Dataset):
+class CellMapZStackDataset(Dataset):
     """Wraps CellMapDataset3D to produce z-slice sequences for SAM3.
 
-    Each sample is a "video" of D z-slices from a 3D EM patch, formatted
-    for SAM3's video predictor with memory propagation across frames.
+    Each sample is a sequence of D z-slices from a 3D EM patch.
 
     Args:
         base_dataset: CellMapDataset3D instance for 3D patch extraction.
-        num_frames: Number of z-slices per video sequence.
+        num_frames: Number of z-slices per sequence.
         frame_stride: Stride between selected z-slices (1=consecutive).
         image_size: SAM3 input resolution (default 1008 for SAM3's ViT).
         mask_size: Output mask resolution for labels (default 256).
@@ -46,19 +44,21 @@ class CellMapVideoDataset(Dataset):
         num_frames: int = 16,
         frame_stride: int = 8,
         image_size: int = 1008,
-        mask_size: int = 256,
+        mask_size: int = 288,
+        transforms=None,
     ):
         self.base_dataset = base_dataset
         self.num_frames = num_frames
         self.frame_stride = frame_stride
         self.image_size = image_size
         self.mask_size = mask_size
+        self.transforms = transforms
 
     def __len__(self) -> int:
         return len(self.base_dataset)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Extract a 3D patch and convert to a video of z-slices.
+        """Extract a 3D patch and convert to a sequence of z-slices.
 
         Returns:
             dict with:
@@ -90,15 +90,19 @@ class CellMapVideoDataset(Dataset):
         slice_spatial = torch.zeros(T, 1, self.mask_size, self.mask_size)
 
         for t, z in enumerate(z_indices):
-            # Raw slice [1, H, W] -> resize to [1, image_size, image_size]
-            raw_slice = raw[:, z, :, :]  # [1, H, W]
-            raw_resized = F.interpolate(
-                raw_slice.unsqueeze(0), size=(self.image_size, self.image_size),
-                mode="bilinear", align_corners=False,
-            ).squeeze(0)  # [1, image_size, image_size]
-
-            # Grayscale -> RGB: repeat across 3 channels
-            images[t] = raw_resized.expand(3, -1, -1)
+            # Use adjacent z-slices as RGB channels: [z-1, z, z+1]
+            # This gives the ViT actual 3D context instead of 3 identical copies
+            for ch_idx, zz in enumerate(
+                [max(z - 1, 0), z, min(z + 1, D - 1)]
+            ):
+                ch_slice = raw[:, zz, :, :]  # [1, H, W]
+                ch_resized = F.interpolate(
+                    ch_slice.unsqueeze(0),
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)  # [1, H, W]
+                images[t, ch_idx] = ch_resized.squeeze(0)  # [H, W]
 
             # Labels [C, H, W] -> resize to [C, mask_size, mask_size]
             label_slice = labels[:, z, :, :]  # [C, H, W]
@@ -113,6 +117,12 @@ class CellMapVideoDataset(Dataset):
                 sp_slice.unsqueeze(0), size=(self.mask_size, self.mask_size),
                 mode="nearest",
             ).squeeze(0)
+
+        # Apply augmentations (training only)
+        if self.transforms is not None:
+            images, slice_labels, slice_spatial = self.transforms(
+                images, slice_labels, slice_spatial
+            )
 
         return {
             "images": images,                 # [T, 3, H, W]

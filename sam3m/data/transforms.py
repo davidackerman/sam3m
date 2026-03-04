@@ -19,7 +19,7 @@ import torchvision.transforms.functional as TF
 
 
 class EMSliceTransforms:
-    """2D augmentations for EM z-slices in a video sequence.
+    """2D augmentations for EM z-slices in a z-stack sequence.
 
     Designed to apply consistent spatial transforms across all z-slices
     and consistent intensity transforms to maintain temporal coherence.
@@ -52,7 +52,7 @@ class EMSliceTransforms:
         labels: torch.Tensor,
         spatial_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply augmentations to a video sequence.
+        """Apply augmentations to a z-stack sequence.
 
         All spatial transforms use the same random seed across frames
         for z-consistency.
@@ -65,7 +65,7 @@ class EMSliceTransforms:
         Returns:
             Augmented (images, labels, spatial_masks).
         """
-        # Sample random state for this video (consistent across slices)
+        # Sample random state for this z-stack (consistent across slices)
         rng = torch.Generator()
         rng.manual_seed(torch.randint(0, 2**31, (1,)).item())
 

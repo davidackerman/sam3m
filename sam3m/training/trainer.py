@@ -1,7 +1,7 @@
 """Training loop for SAM3 CellMap fine-tuning.
 
 Handles:
-- Video-mode training (z-slices as frames with memory propagation)
+- Z-stack training (z-slices as frames)
 - Mixed precision (AMP) with gradient scaling
 - Gradient accumulation for effective larger batches
 - Per-class Dice validation
@@ -11,18 +11,22 @@ Handles:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import torchvision.utils as vutils
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +83,7 @@ class CellMapTrainer:
     """Training loop for SAM3 CellMap fine-tuning.
 
     Per training step (Mode A):
-    1. Sample video batch from CellMapVideoDataset
+    1. Sample z-stack batch from CellMapZStackDataset
     2. For each z-slice: forward through SAM3 + CellMap head
     3. Compute per-slice masked BCE+Dice + hierarchical loss
     4. Add z-consistency loss across slice predictions
@@ -117,8 +121,11 @@ class CellMapTrainer:
         self.tb_writer = tb_writer
         self.log_every_n_steps = log_every_n_steps
         self.log_images_every_n_steps = self.config.get("log_images_every_n_steps", 50)
+        self.n_image_samples = self.config.get("n_image_samples", 4)
 
         self.device = next(model.parameters()).device
+        # Unwrap DDP for attribute access (checkpointing, validation)
+        self._base_model = model.module if hasattr(model, "module") else model
         self.use_amp = self.config.get("use_amp", True)
         self.scaler = GradScaler("cuda", enabled=self.use_amp)
         self.accumulation_steps = self.config.get("accumulation_steps", 8)
@@ -143,61 +150,109 @@ class CellMapTrainer:
                 self._vis_indices.append(EVALUATED_CLASSES.index(cls_name))
                 self._vis_colors.append(color)
 
+    @staticmethod
+    def _draw_text_on_tensor(img: torch.Tensor, text: str) -> torch.Tensor:
+        """Draw text label on a [3, H, W] image tensor (top-left corner)."""
+        H, W = img.shape[-2:]
+        pil = Image.fromarray(
+            (img.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype("uint8")
+        )
+        draw = ImageDraw.Draw(pil)
+        font_size = max(12, H // 20)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+        # Draw with black outline for readability
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            draw.text((4 + dx, 4 + dy), text, fill=(0, 0, 0), font=font)
+        draw.text((4, 4), text, fill=(255, 255, 255), font=font)
+        return torch.from_numpy(
+            np.array(pil, dtype=np.float32) / 255.0
+        ).permute(2, 0, 1)
+
     @torch.no_grad()
-    def _log_sample_images(
+    def _log_sample_grid(
         self,
         tag: str,
-        image: torch.Tensor,
-        labels: torch.Tensor,
-        logits: torch.Tensor,
+        batches: list,
         step: int,
     ):
-        """Log a side-by-side [raw | GT | prediction] image to TensorBoard.
+        """Log a multi-row grid of [raw | GT | prediction] to TensorBoard.
+
+        Each row is one sample (middle z-slice of a batch). The grid has
+        3 columns (raw, GT overlay, prediction overlay) and N rows.
 
         Args:
             tag: TensorBoard tag prefix ("train" or "val").
-            image: [3, H, W] input image (RGB, 0-1 range).
-            labels: [C, Hm, Wm] ground truth binary masks.
-            logits: [C, Hm, Wm] predicted logits.
+            batches: List of batch dicts from the DataLoader.
             step: TensorBoard step.
         """
-        if self.tb_writer is None or not self._vis_indices:
+        if self.tb_writer is None or not self._vis_indices or not batches:
             return
 
-        H, W = labels.shape[-2:]
+        all_panels = []  # flat list: [raw0, gt0, pred0, raw1, gt1, pred1, ...]
 
-        # Raw grayscale → [3, H, W]
-        raw = F.interpolate(
-            image.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
-        ).squeeze(0).cpu().clamp(0, 1)
+        for batch in batches:
+            # Use first item in the batch for visualization
+            images = batch["images"][:1].squeeze(0).to(self.device)   # [T, 3, H, W]
+            labels = batch["labels"][:1].squeeze(0).to(self.device)    # [T, C, Hm, Wm]
+            sf = batch.get("scale_factor")
+            if sf is not None:
+                sf = sf[:1].to(self.device)
 
-        # Build color overlays for GT and prediction
-        gt_overlay = raw.clone()
-        pred_overlay = raw.clone()
-        probs = torch.sigmoid(logits).cpu()
-        labels_cpu = labels.cpu().float()
-
-        alpha = 0.5
-        for idx, (r, g, b) in zip(self._vis_indices, self._vis_colors):
-            color = torch.tensor([r, g, b], dtype=torch.float32).view(3, 1, 1)
-
-            # GT overlay
-            gt_mask = labels_cpu[idx] > 0.5  # [H, W]
-            if gt_mask.any():
-                gt_overlay[:, gt_mask] = (
-                    (1 - alpha) * gt_overlay[:, gt_mask] + alpha * color.expand_as(gt_overlay[:, gt_mask])
+            mid = images.shape[0] // 2
+            with autocast(device_type="cuda", enabled=self.use_amp):
+                out = self.model(
+                    images[mid].unsqueeze(0), target_size=labels.shape[-2:],
+                    scale_factor=sf,
                 )
 
-            # Prediction overlay
-            pred_mask = probs[idx] > 0.5
-            if pred_mask.any():
-                pred_overlay[:, pred_mask] = (
-                    (1 - alpha) * pred_overlay[:, pred_mask] + alpha * color.expand_as(pred_overlay[:, pred_mask])
-                )
+            image = images[mid]          # [3, H, W]
+            lbl = labels[mid]            # [C, Hm, Wm]
+            logits = out["fine"].squeeze(0)  # [C, Hm, Wm]
 
-        # Stack as [3, 3, H, W] grid → single image
-        grid = vutils.make_grid([raw, gt_overlay, pred_overlay], nrow=3, padding=4)
-        self.tb_writer.add_image(f"{tag}/raw_gt_pred", grid, step)
+            H, W = lbl.shape[-2:]
+
+            # Raw grayscale → [3, H, W]
+            raw = F.interpolate(
+                image.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
+            ).squeeze(0).cpu().clamp(0, 1)
+
+            gt_overlay = raw.clone()
+            pred_overlay = raw.clone()
+            probs = torch.sigmoid(logits).cpu()
+            labels_cpu = lbl.cpu().float()
+
+            alpha = 0.5
+            for idx, (r, g, b) in zip(self._vis_indices, self._vis_colors):
+                color = torch.tensor([r, g, b], dtype=torch.float32).view(3, 1)
+
+                gt_mask = labels_cpu[idx] > 0.5
+                if gt_mask.any():
+                    gt_overlay[:, gt_mask] = (
+                        (1 - alpha) * gt_overlay[:, gt_mask]
+                        + alpha * color.expand_as(gt_overlay[:, gt_mask])
+                    )
+
+                pred_mask = probs[idx] > 0.5
+                if pred_mask.any():
+                    pred_overlay[:, pred_mask] = (
+                        (1 - alpha) * pred_overlay[:, pred_mask]
+                        + alpha * color.expand_as(pred_overlay[:, pred_mask])
+                    )
+
+            # Draw crop name on the raw panel
+            crop_name = batch.get("crop_name")
+            if crop_name is not None:
+                label_text = crop_name[0] if isinstance(crop_name, (list, tuple)) else crop_name
+                raw = self._draw_text_on_tensor(raw, str(label_text))
+
+            all_panels.extend([raw, gt_overlay, pred_overlay])
+
+        # N rows × 3 columns
+        grid = vutils.make_grid(all_panels, nrow=3, padding=4)
+        self.tb_writer.add_image(f"{tag}/samples", grid, step)
 
     def train_epoch(self) -> Dict[str, float]:
         """Run one training epoch."""
@@ -208,19 +263,37 @@ class CellMapTrainer:
         progress = self.epoch / max(max_epochs, 1)
 
         self.optimizer.zero_grad()
-        last_batch = None
+        saved_batches = []
+        n_total = len(self.train_loader)
+        # Evenly spaced indices to collect image samples from
+        if n_total > 0 and self.n_image_samples > 0:
+            save_indices = set(
+                int(i * n_total / self.n_image_samples)
+                for i in range(self.n_image_samples)
+            )
+        else:
+            save_indices = set()
 
         for batch_idx, batch in enumerate(self.train_loader):
-            last_batch = batch
+            if batch_idx in save_indices and len(saved_batches) < self.n_image_samples:
+                saved_batches.append(batch)
             loss, log_dict = self._train_step(batch, progress)
 
             # Scale loss for gradient accumulation
             loss = loss / self.accumulation_steps
 
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # Skip DDP gradient sync on intermediate accumulation steps
+            is_accumulation_step = (batch_idx + 1) % self.accumulation_steps != 0
+            sync_context = (
+                self.model.no_sync()
+                if is_accumulation_step and isinstance(self.model, DDP)
+                else contextlib.nullcontext()
+            )
+            with sync_context:
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             # Optimizer step every accumulation_steps
             if (batch_idx + 1) % self.accumulation_steps == 0:
@@ -243,27 +316,13 @@ class CellMapTrainer:
                         "train/lr", self.optimizer.param_groups[0]["lr"], self.global_step
                     )
 
-                # Mid-epoch image logging
+                # Mid-epoch image logging (single sample)
                 if (
                     self.tb_writer is not None
                     and self.global_step % self.log_images_every_n_steps == 0
                 ):
                     self.model.eval()
-                    imgs = batch["images"].squeeze(0).to(self.device)
-                    lbls = batch["labels"].squeeze(0).to(self.device)
-                    sf = batch.get("scale_factor")
-                    if sf is not None:
-                        sf = sf.to(self.device)
-                    mid = imgs.shape[0] // 2
-                    with torch.no_grad(), autocast(device_type="cuda", enabled=self.use_amp):
-                        step_out = self.model(
-                            imgs[mid].unsqueeze(0), target_size=lbls.shape[-2:],
-                            scale_factor=sf,
-                        )
-                    self._log_sample_images(
-                        "train", imgs[mid], lbls[mid],
-                        step_out["fine"].squeeze(0), self.global_step,
-                    )
+                    self._log_sample_grid("train_step", [batch], self.global_step)
                     self.model.train()
 
             # Accumulate metrics
@@ -288,23 +347,10 @@ class CellMapTrainer:
                 "train_epoch/lr", self.optimizer.param_groups[0]["lr"], self.epoch
             )
 
-            # Log training sample images (middle z-slice of last batch)
-            if last_batch is not None:
+            # Log training sample grid (multiple crops spread across the epoch)
+            if saved_batches:
                 self.model.eval()
-                images = last_batch["images"].squeeze(0).to(self.device)
-                labels = last_batch["labels"].squeeze(0).to(self.device)
-                last_scale = last_batch.get("scale_factor")
-                if last_scale is not None:
-                    last_scale = last_scale.to(self.device)
-                mid = images.shape[0] // 2
-                with torch.no_grad(), autocast(device_type="cuda", enabled=self.use_amp):
-                    out = self.model(
-                        images[mid].unsqueeze(0), target_size=labels.shape[-2:],
-                        scale_factor=last_scale,
-                    )
-                self._log_sample_images(
-                    "train", images[mid], labels[mid], out["fine"].squeeze(0), self.epoch
-                )
+                self._log_sample_grid("train", saved_batches, self.epoch)
                 self.model.train()
 
         self.epoch += 1
@@ -313,74 +359,73 @@ class CellMapTrainer:
     def _train_step(
         self, batch: Dict[str, torch.Tensor], progress: float
     ) -> tuple:
-        """Process one video batch (z-stack as frames).
+        """Process one z-stack batch.
 
         Args:
-            batch: Dict from CellMapVideoDataset.__getitem__
+            batch: Dict from CellMapZStackDataset.__getitem__
             progress: Training progress 0->1 for dynamic loss weighting.
 
         Returns:
             (total_loss, log_dict)
         """
-        # DataLoader adds batch dim: [B, T, ...] -> squeeze to [T, ...]
-        # since we use batch_size=1 and process frames individually
-        images = batch["images"].squeeze(0).to(self.device)          # [T, 3, H, W]
-        labels = batch["labels"].squeeze(0).to(self.device)           # [T, C, Hm, Wm]
-        annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)  # [C]
-        spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)    # [T, 1, Hm, Wm]
-        scale_factor = batch.get("scale_factor")
-        if scale_factor is not None:
-            scale_factor = scale_factor.to(self.device)  # [B] -> scalar after squeeze
+        images = batch["images"].to(self.device)              # [B, T, 3, H, W]
+        labels = batch["labels"].to(self.device)               # [B, T, C, Hm, Wm]
+        annotated_mask = batch["annotated_mask"].to(self.device)  # [B, C]
+        spatial_masks = batch["spatial_masks"].to(self.device)    # [B, T, 1, Hm, Wm]
+        scale_factors = batch.get("scale_factor")
+        if scale_factors is not None:
+            scale_factors = scale_factors.to(self.device)  # [B]
 
-        T = images.shape[0]
+        B, T = images.shape[:2]
         total_loss = torch.tensor(0.0, device=self.device)
-        all_logits = []
         log_dict = {}
 
         with autocast(device_type="cuda", enabled=self.use_amp):
-            # Process each z-slice through the model
-            for t in range(T):
-                frame = images[t].unsqueeze(0)  # [1, 3, H, W]
+            for b in range(B):
+                sf = scale_factors[b] if scale_factors is not None else None
+
+                # Batch all T frames through backbone at once (T as batch dim)
+                all_frames = images[b]  # [T, 3, H, W]
                 outputs = self.model(
-                    frame, target_size=labels.shape[-2:],
-                    scale_factor=scale_factor,
+                    all_frames, target_size=labels.shape[-2:],
+                    scale_factor=sf,
                 )
+                # outputs["fine"]: [T, C, Hm, Wm]
 
-                # Per-slice loss (unsqueeze to add dummy depth dim for 5D loss)
-                slice_labels = labels[t].unsqueeze(0).unsqueeze(2)  # [1, C, 1, Hm, Wm]
-                slice_mask = annotated_mask.unsqueeze(0)  # [1, C]
-                slice_spatial = spatial_masks[t].unsqueeze(0).unsqueeze(2)  # [1, 1, 1, Hm, Wm]
-
-                # Also unsqueeze the logits to 5D
+                # Reshape to 5D for loss: T becomes depth dim → [1, C, T, Hm, Wm]
                 outputs_5d = {}
                 for k, v in outputs.items():
-                    outputs_5d[k] = v.unsqueeze(2)  # [1, C, 1, H, W]
+                    outputs_5d[k] = v.permute(1, 0, 2, 3).unsqueeze(0)
 
-                slice_loss, slice_log = self.loss_fn(
-                    outputs_5d, slice_labels, slice_mask,
-                    progress=progress, spatial_mask=slice_spatial,
+                labels_5d = labels[b].permute(1, 0, 2, 3).unsqueeze(0)        # [1, C, T, Hm, Wm]
+                spatial_5d = spatial_masks[b].permute(1, 0, 2, 3).unsqueeze(0)  # [1, 1, T, Hm, Wm]
+                mask_1 = annotated_mask[b].unsqueeze(0)                         # [1, C]
+
+                batch_loss, batch_log = self.loss_fn(
+                    outputs_5d, labels_5d, mask_1,
+                    progress=progress, spatial_mask=spatial_5d,
                 )
-                total_loss = total_loss + slice_loss / T
+                total_loss = total_loss + batch_loss / B
 
-                all_logits.append(outputs["fine"].squeeze(0))  # [C, H, W]
+                # Z-consistency loss
+                if T > 1 and self.z_consistency_weight > 0:
+                    all_logits = outputs["fine"]  # [T, C, Hm, Wm]
+                    stacked_labels = labels[b]     # [T, C, Hm, Wm]
 
-            # Z-consistency loss
-            if T > 1 and self.z_consistency_weight > 0:
-                stacked_logits = torch.stack(all_logits, dim=0)  # [T, C, H, W]
-                stacked_labels = labels  # [T, C, Hm, Wm]
+                    if all_logits.shape[-2:] != stacked_labels.shape[-2:]:
+                        all_logits = F.interpolate(
+                            all_logits,
+                            size=stacked_labels.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
 
-                # Resize logits to match label size if different
-                if stacked_logits.shape[-2:] != stacked_labels.shape[-2:]:
-                    stacked_logits = F.interpolate(
-                        stacked_logits,
-                        size=stacked_labels.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
+                    z_loss = self.z_consistency_loss(all_logits, stacked_labels)
+                    total_loss = total_loss + self.z_consistency_weight * z_loss / B
+                    log_dict["z_consistency_loss"] = (
+                        log_dict.get("z_consistency_loss", 0.0)
+                        + z_loss.detach().item() / B
                     )
-
-                z_loss = self.z_consistency_loss(stacked_logits, stacked_labels)
-                total_loss = total_loss + self.z_consistency_weight * z_loss
-                log_dict["z_consistency_loss"] = z_loss.detach().item()
 
         log_dict["total_loss"] = total_loss.detach().item()
         return total_loss, log_dict
@@ -392,62 +437,69 @@ class CellMapTrainer:
             return {}
 
         self.model.eval()
-        n_classes = self.model.cellmap_head.n_fine
+        n_classes = self._base_model.cellmap_head.n_fine
 
         # Accumulate per-class dice components
         dice_inter = torch.zeros(n_classes, device=self.device)
         dice_union = torch.zeros(n_classes, device=self.device)
         dice_count = torch.zeros(n_classes, device=self.device)
 
-        logged_val_image = False
+        val_image_batches = []
+        n_val_total = len(self.val_loader)
+        if n_val_total > 0 and self.n_image_samples > 0:
+            val_save_indices = set(
+                int(i * n_val_total / self.n_image_samples)
+                for i in range(self.n_image_samples)
+            )
+        else:
+            val_save_indices = set()
 
-        for batch in self.val_loader:
-            images = batch["images"].squeeze(0).to(self.device)
-            labels = batch["labels"].squeeze(0).to(self.device)
-            annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)
-            spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)
-            scale_factor = batch.get("scale_factor")
-            if scale_factor is not None:
-                scale_factor = scale_factor.to(self.device)
+        for batch_idx, batch in enumerate(self.val_loader):
+            if batch_idx in val_save_indices and len(val_image_batches) < self.n_image_samples:
+                val_image_batches.append(batch)
 
-            T = images.shape[0]
+            images = batch["images"].to(self.device)              # [B, T, 3, H, W]
+            labels = batch["labels"].to(self.device)               # [B, T, C, Hm, Wm]
+            annotated_mask = batch["annotated_mask"].to(self.device)  # [B, C]
+            spatial_masks = batch["spatial_masks"].to(self.device)    # [B, T, 1, Hm, Wm]
+            scale_factors = batch.get("scale_factor")
+            if scale_factors is not None:
+                scale_factors = scale_factors.to(self.device)
 
-            for t in range(T):
-                frame = images[t].unsqueeze(0)
-                outputs = self.model(
-                    frame, target_size=labels.shape[-2:],
-                    scale_factor=scale_factor,
-                )
-                probs = torch.sigmoid(outputs["fine"]).squeeze(0)  # [C, H, W]
+            B, T = images.shape[:2]
 
-                pred_binary = (probs > 0.5).float()
-                gt = labels[t]  # [C, Hm, Wm]
-                sp = spatial_masks[t]  # [1, Hm, Wm]
+            for b in range(B):
+                sf = scale_factors[b] if scale_factors is not None else None
 
-                for c in range(n_classes):
-                    if not annotated_mask[c]:
-                        continue
-                    p = pred_binary[c] * sp.squeeze(0)
-                    g = gt[c] * sp.squeeze(0)
-                    inter = (p * g).sum()
-                    union = p.sum() + g.sum()
-                    if union > 0:
-                        dice_inter[c] += inter
-                        dice_union[c] += union
-                        dice_count[c] += 1
-
-            # Log first val batch middle slice
-            if not logged_val_image and self.tb_writer is not None:
-                mid = T // 2
+                # Batch all T frames through backbone at once
+                all_frames = images[b]  # [T, 3, H, W]
                 with autocast(device_type="cuda", enabled=self.use_amp):
-                    mid_out = self.model(
-                        images[mid].unsqueeze(0), target_size=labels.shape[-2:],
-                        scale_factor=scale_factor,
+                    outputs = self.model(
+                        all_frames, target_size=labels.shape[-2:],
+                        scale_factor=sf,
                     )
-                self._log_sample_images(
-                    "val", images[mid], labels[mid], mid_out["fine"].squeeze(0), self.epoch
-                )
-                logged_val_image = True
+                all_probs = torch.sigmoid(outputs["fine"])  # [T, C, Hm, Wm]
+
+                for t in range(T):
+                    pred_binary = (all_probs[t] > 0.5).float()
+                    gt = labels[b, t]  # [C, Hm, Wm]
+                    sp = spatial_masks[b, t]  # [1, Hm, Wm]
+
+                    for c in range(n_classes):
+                        if not annotated_mask[b, c]:
+                            continue
+                        p = pred_binary[c] * sp.squeeze(0)
+                        g = gt[c] * sp.squeeze(0)
+                        inter = (p * g).sum()
+                        union = p.sum() + g.sum()
+                        if union > 0:
+                            dice_inter[c] += inter
+                            dice_union[c] += union
+                            dice_count[c] += 1
+
+        # Log val sample grid
+        if val_image_batches:
+            self._log_sample_grid("val", val_image_batches, self.epoch)
 
         # Compute per-class dice
         metrics = {}
@@ -481,8 +533,8 @@ class CellMapTrainer:
             "epoch": self.epoch,
             "global_step": self.global_step,
             "best_val_dice": self.best_val_dice,
-            "lora_state_dict": lora_state_dict(self.model),
-            "cellmap_head_state_dict": self.model.cellmap_head.state_dict(),
+            "lora_state_dict": lora_state_dict(self._base_model),
+            "cellmap_head_state_dict": self._base_model.cellmap_head.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
         if self.scheduler is not None:
@@ -505,12 +557,12 @@ class CellMapTrainer:
 
         # Load LoRA params
         lora_sd = state["lora_state_dict"]
-        model_sd = self.model.state_dict()
+        model_sd = self._base_model.state_dict()
         model_sd.update(lora_sd)
-        self.model.load_state_dict(model_sd, strict=False)
+        self._base_model.load_state_dict(model_sd, strict=False)
 
         # Load head
-        self.model.cellmap_head.load_state_dict(state["cellmap_head_state_dict"])
+        self._base_model.cellmap_head.load_state_dict(state["cellmap_head_state_dict"])
 
         # Load optimizer
         self.optimizer.load_state_dict(state["optimizer_state_dict"])

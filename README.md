@@ -4,13 +4,9 @@ Fine-tuning [SAM3](https://github.com/facebookresearch/sam3) (Segment Anything M
 
 ## Overview
 
-SAM3M adapts SAM3's 848M-parameter vision-language model to segment 48 organelle classes in FIB-SEM electron microscopy volumes. Z-stacks are treated as pseudo-video, leveraging SAM3's memory-based video predictor for 3D consistency.
+SAM3M adapts SAM3's 848M-parameter vision-language model to segment 48 organelle classes in FIB-SEM electron microscopy volumes. Z-stacks are processed as sequences of 2D slices, with adjacent z-slices fed as RGB channels to give the ViT 3D context.
 
-**Two output modes:**
-- **Mode A** (primary): Dense 48-class segmentation head on SAM3's pixel decoder — one forward pass produces all class predictions
-- **Mode B** (future): SAM3's native text/point prompting fine-tuned for organelles — say "mito" to segment mitochondria, click to select instances
-
-Only ~1.5% of parameters are trained via LoRA adapters on the vision encoder plus a new segmentation head.
+Only ~0.25% of parameters are trained: LoRA adapters on the vision encoder plus a fully-trained segmentation head.
 
 ## Setup
 
@@ -25,13 +21,13 @@ This installs Python 3.12, SAM3, PyTorch, and all dependencies.
 ```
 sam3m/
 ├── sam3m/
-│   ├── data/           # CellMapDataset3D, video wrapper, class hierarchy, augmentations
+│   ├── data/           # CellMapDataset3D, z-stack wrapper, class hierarchy, augmentations
 │   ├── model/          # LoRA adapters, CellMap segmentation head, SAM3 assembly
 │   ├── losses/         # Masked BCE+Dice, hierarchical, boundary-aware, z-consistency
 │   ├── training/       # Trainer loop, train/val split
 │   └── inference/      # Sliding window prediction, watershed postprocessing
 ├── configs/
-│   ├── train_video.yaml           # Training configuration
+│   ├── train.yaml                 # Training configuration
 │   ├── norms.csv                  # Per-dataset normalization parameters
 │   ├── challenge_train_crops.csv  # CellMap challenge training manifest (22 datasets, ~250 crops)
 │   └── challenge_test_crops.csv   # CellMap challenge test manifest (6 datasets, 16 crops)
@@ -45,33 +41,34 @@ sam3m/
 ## Architecture
 
 ```
-Input: [B, 3, 1008, 1008] (grayscale EM repeated to RGB)
-  → SAM3 ViT backbone + LoRA (frozen weights + rank-8 adapters)
+Input: [B, 3, 1008, 1008] (adjacent z-slices [z-1, z, z+1] as RGB)
+  → SAM3 ViT backbone + LoRA (frozen weights + rank-16 adapters)
   → FPN neck → multi-scale features (288², 144², 72²)
   → PixelDecoder → [B, 256, 288, 288]
-  → CellMapSegmentationHead → [B, 48, H, W] per-class logits
+  → CellMapSegmentationHead (Conv3x3 + Conv1x1 → 48 classes)
+  → [B, 48, H, W] per-class logits (sigmoid, multi-label)
 ```
 
 | Component | Params | Training |
 |-----------|--------|----------|
-| ViT vision encoder | ~630M | LoRA only (1.57M) |
+| ViT vision encoder | ~630M | LoRA only (~2M) |
 | Text encoder | ~150M | Frozen |
 | Pixel decoder (FPN) | ~15M | Frozen |
-| CellMapSegmentationHead | ~0.5M | Fully trained |
-| **Total trainable** | | **~2.1M (0.2%)** |
+| CellMapSegmentationHead | ~1.5M | Fully trained |
+| **Total trainable** | | **~3.5M (0.4%)** |
 
 ## Data
 
 Uses the CellMap challenge data at `/nrs/cellmap/data/` (48 organelle classes across 22 datasets). The data pipeline:
 
 1. **CellMapDataset3D** extracts 128³ patches from zarr volumes, resampled to 8nm isotropic
-2. **CellMapVideoDataset** converts patches to 16-frame pseudo-videos (z-slices at stride 8, resized to 1008×1008)
-3. **ClassBalancedSampler** ensures rare classes get sufficient training signal
+2. **CellMapZStackDataset** converts patches to 48-frame z-stacks; each frame uses adjacent z-slices [z-1, z, z+1] as RGB channels for 3D context
+3. **ClassBalancedSampler** ensures rare classes get sufficient training signal (DDP-aware)
 4. **Multi-scale training** (optional) — randomly varies the effective resolution per sample, with FiLM conditioning on the segmentation head
 
 ### Dataset filtering
 
-By default, training uses only the official CellMap challenge training crops (`challenge_split: train` in config). This is controlled in `configs/train_video.yaml`:
+By default, training uses only the official CellMap challenge training crops (`challenge_split: train` in config). This is controlled in `configs/train.yaml`:
 
 ```yaml
 # Only challenge training crops (default)
@@ -93,7 +90,7 @@ Crop manifests are sourced from [janelia-cellmap/cellmap-segmentation-challenge]
 By default, patches are extracted at 8nm resolution (`scale_factors: [1]`). Enabling multi-scale training reads proportionally larger world volumes at the same 128³ voxel output, giving the model different effective resolutions:
 
 ```yaml
-# configs/train_video.yaml
+# configs/train.yaml
 scale_factors: [1, 2, 4]  # 8nm, 16nm, 32nm effective resolution
 ```
 
@@ -104,11 +101,15 @@ When `scale_factors: [1]` (default), the FiLM layer is not created and there is 
 ## Training
 
 ```bash
+# Single GPU
 pixi run train
-# or with a specific config / run name:
-pixi run train --config configs/train_video.yaml
-pixi run train --run-name lora-r8-lr2e4
-# resume from checkpoint:
+pixi run train --config configs/train.yaml --run-name my-experiment
+
+# Multi-GPU (DDP)
+pixi run train-ddp
+torchrun --nproc_per_node=8 scripts/train.py
+
+# Resume from checkpoint
 pixi run train --resume runs/2026-03-03_14-30-00/checkpoints/checkpoint_epoch50.pt
 ```
 
@@ -127,11 +128,11 @@ runs/2026-03-03_14-30-00/
 
 View training curves: `tensorboard --logdir runs/`
 
-Key settings (see `configs/train_video.yaml`):
-- Batch size 1 per GPU, gradient accumulation 8
-- AdamW, lr=2e-4, cosine annealing with warm restarts
-- Mixed precision (AMP)
-- Multi-GPU via DDP (up to 8 GPUs)
+Key settings (see `configs/train.yaml`):
+- Batch size 1 per GPU, gradient accumulation 4
+- AdamW with per-group LRs: LoRA lr=2e-4, head lr=1e-3
+- Mixed precision (AMP), cosine annealing with warm restarts
+- Multi-GPU via DDP (torchrun), up to 8 GPUs
 
 ## Verification
 

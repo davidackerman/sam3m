@@ -67,6 +67,7 @@ class CellMapVideoDataset(Dataset):
                 annotated_mask: [C] bool — which classes are annotated
                 spatial_masks: [T, 1, Hm, Wm] float32 — per-slice spatial validity
                 crop_name: str — dataset/crop identifier
+                scale_factor: scalar float32 — effective scale (1.0 = native res)
         """
         # Get 3D patch from base dataset
         result = self.base_dataset[idx]
@@ -75,6 +76,7 @@ class CellMapVideoDataset(Dataset):
         annotated_mask = result[2]   # [C]
         spatial_mask = result[3]     # [1, D, H, W]
         crop_name = result[4]        # str
+        scale_factor = result[5]     # float
 
         D = raw.shape[1]
 
@@ -118,6 +120,7 @@ class CellMapVideoDataset(Dataset):
             "annotated_mask": annotated_mask,  # [C]
             "spatial_masks": slice_spatial,    # [T, 1, Hm, Wm]
             "crop_name": crop_name,
+            "scale_factor": torch.tensor(scale_factor, dtype=torch.float32),  # scalar
         }
 
     def _select_z_indices(self, depth: int) -> List[int]:

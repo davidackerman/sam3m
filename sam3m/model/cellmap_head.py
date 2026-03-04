@@ -25,6 +25,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ScaleConditioner(nn.Module):
+    """FiLM (Feature-wise Linear Modulation) for scale conditioning.
+
+    Takes an explicit scale factor as input and produces per-channel
+    gamma/beta to modulate pixel features. The model does not predict
+    the scale — it receives it as a known input.
+    """
+
+    def __init__(self, n_channels: int, hidden: int = 64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 2 * n_channels),
+        )
+        # Initialize to identity transform (gamma=1, beta=0)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+        self.mlp[-1].bias.data[:n_channels] = 1.0  # gamma = 1
+
+    def forward(
+        self, features: torch.Tensor, scale_factor: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply FiLM conditioning.
+
+        Args:
+            features: [B, C, H, W] pixel features.
+            scale_factor: [B] or scalar — known scale factor.
+
+        Returns:
+            Modulated features [B, C, H, W].
+        """
+        # Ensure scale_factor is [B, 1]
+        if scale_factor.dim() == 0:
+            scale_factor = scale_factor.unsqueeze(0)
+        scale_factor = scale_factor.view(-1, 1).to(features.device)
+
+        params = self.mlp(scale_factor)  # [B, 2*C]
+        gamma, beta = params.chunk(2, dim=-1)  # each [B, C]
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        return gamma * features + beta
+
+
 class CellMapSegmentationHead(nn.Module):
     """48-class dense segmentation head for CellMap challenge.
 
@@ -36,6 +81,7 @@ class CellMapSegmentationHead(nn.Module):
         n_coarse: Number of coarse-level classes for auxiliary head (default 7).
         use_auxiliary: Whether to create medium/coarse auxiliary heads.
         upsample_factor: Factor to upsample output to full resolution.
+        use_scale_conditioning: Whether to add FiLM scale conditioning.
     """
 
     def __init__(
@@ -47,6 +93,7 @@ class CellMapSegmentationHead(nn.Module):
         n_coarse: int = 7,
         use_auxiliary: bool = True,
         upsample_factor: int = 4,
+        use_scale_conditioning: bool = False,
     ):
         super().__init__()
         self.n_fine = n_fine
@@ -54,6 +101,10 @@ class CellMapSegmentationHead(nn.Module):
         self.n_coarse = n_coarse
         self.use_auxiliary = use_auxiliary
         self.upsample_factor = upsample_factor
+        self.use_scale_conditioning = use_scale_conditioning
+
+        if use_scale_conditioning:
+            self.scale_conditioner = ScaleConditioner(in_channels)
 
         # Main fine-level head
         self.fine_head = nn.Sequential(
@@ -95,6 +146,7 @@ class CellMapSegmentationHead(nn.Module):
         self,
         pixel_features: torch.Tensor,
         target_size: Optional[tuple] = None,
+        scale_factor: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass producing multi-label predictions.
 
@@ -102,6 +154,8 @@ class CellMapSegmentationHead(nn.Module):
             pixel_features: [B, 256, H/4, W/4] from SAM3's pixel decoder.
             target_size: Optional (H, W) to upsample predictions to.
                 If None, uses upsample_factor.
+            scale_factor: Optional [B] tensor — known scale factor for
+                FiLM conditioning. Only used if use_scale_conditioning=True.
 
         Returns:
             dict with:
@@ -109,6 +163,10 @@ class CellMapSegmentationHead(nn.Module):
                 "medium": [B, 17, H, W] logits (if use_auxiliary)
                 "coarse": [B, 7, H, W] logits (if use_auxiliary)
         """
+        # Apply FiLM scale conditioning before heads
+        if self.use_scale_conditioning and scale_factor is not None:
+            pixel_features = self.scale_conditioner(pixel_features, scale_factor)
+
         fine_logits = self.fine_head(pixel_features)
 
         # Upsample to target resolution

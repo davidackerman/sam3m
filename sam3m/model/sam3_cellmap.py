@@ -97,18 +97,22 @@ class SAM3CellMapModel(nn.Module):
         self,
         images: torch.Tensor,
         target_size: Optional[tuple] = None,
+        scale_factor: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass for Mode A (dense 48-class prediction).
 
         Args:
             images: [B, 3, 1008, 1008] RGB images (grayscale repeated 3x).
             target_size: Optional (H, W) for output resolution.
+            scale_factor: Optional [B] tensor — known scale for FiLM conditioning.
 
         Returns:
             dict with "fine" [B, 48, H, W], optionally "medium", "coarse".
         """
         pixel_features = self.forward_features(images)
-        return self.cellmap_head(pixel_features, target_size=target_size)
+        return self.cellmap_head(
+            pixel_features, target_size=target_size, scale_factor=scale_factor
+        )
 
 
 def build_cellmap_model(
@@ -121,6 +125,7 @@ def build_cellmap_model(
     n_medium: int = 17,
     n_coarse: int = 7,
     use_auxiliary: bool = True,
+    use_scale_conditioning: bool = False,
     device: str = "cuda",
 ) -> SAM3CellMapModel:
     """Build SAM3 model configured for CellMap segmentation.
@@ -191,6 +196,7 @@ def build_cellmap_model(
         n_coarse=n_coarse,
         use_auxiliary=use_auxiliary,
         upsample_factor=1,  # pixel decoder already at high res (288x288)
+        use_scale_conditioning=use_scale_conditioning,
     ).to(device)
 
     # 5. Assemble

@@ -51,6 +51,33 @@ INSTANCE_CLASS_INDEX = {name: i for i, name in enumerate(EVALUATED_INSTANCE_CLAS
 
 
 # ---------------------------------------------------------------------------
+# Challenge manifest helpers
+# ---------------------------------------------------------------------------
+
+def load_challenge_manifest(csv_path: str) -> set:
+    """Load a challenge crop manifest CSV and return (dataset, crop_id) pairs.
+
+    The manifest has columns: crop_name,dataset,class_label,...
+    Multiple rows per crop (one per class). Returns unique (dataset, crop_id)
+    pairs where crop_id is the numeric string (e.g., "234").
+    """
+    pairs = set()
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pairs.add((row["dataset"].strip(), row["crop_name"].strip()))
+    return pairs
+
+
+_CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "configs")
+
+CHALLENGE_MANIFESTS = {
+    "train": os.path.join(_CONFIGS_DIR, "challenge_train_crops.csv"),
+    "test": os.path.join(_CONFIGS_DIR, "challenge_test_crops.csv"),
+}
+
+
+# ---------------------------------------------------------------------------
 # Zarr metadata helpers
 # ---------------------------------------------------------------------------
 
@@ -232,7 +259,10 @@ class CellMapDataset3D(Dataset):
         seed: int = 42,
         transforms=None,
         skip_datasets: List[str] = None,
+        include_datasets: List[str] = None,
+        challenge_split: str = None,
         instance_mode: bool = False,
+        scale_factors: List[float] = None,
     ):
         self.data_root = data_root
         self.target_classes = target_classes or EVALUATED_CLASSES
@@ -240,13 +270,37 @@ class CellMapDataset3D(Dataset):
         self.target_resolution = target_resolution
         self.patch_size = np.array(patch_size)
         self.patch_world = self.patch_size * target_resolution
+        self.scale_factors = scale_factors or [1.0]
         self.samples_per_epoch = samples_per_epoch
         self.min_crop_voxels = min_crop_voxels
         self.max_resolution_ratio = max_resolution_ratio
         self.rng = np.random.default_rng(seed)
         self.transforms = transforms
         self.skip_datasets = set(skip_datasets or [])
+        self.include_datasets = set(include_datasets) if include_datasets else None
+        self.challenge_split = challenge_split
         self.instance_mode = instance_mode
+
+        # Load challenge manifest for crop-level filtering
+        self._challenge_crops = None
+        if challenge_split is not None:
+            if challenge_split not in CHALLENGE_MANIFESTS:
+                raise ValueError(
+                    f"challenge_split must be one of {list(CHALLENGE_MANIFESTS)}, "
+                    f"got '{challenge_split}'"
+                )
+            manifest_path = CHALLENGE_MANIFESTS[challenge_split]
+            self._challenge_crops = load_challenge_manifest(manifest_path)
+            # Also restrict to only the datasets in the manifest (speeds up discovery)
+            manifest_datasets = {ds for ds, _ in self._challenge_crops}
+            if self.include_datasets is not None:
+                self.include_datasets &= manifest_datasets
+            else:
+                self.include_datasets = manifest_datasets
+            logger.info(
+                f"Challenge split '{challenge_split}': {len(self._challenge_crops)} "
+                f"crops across {len(manifest_datasets)} datasets"
+            )
 
         # Instance class mapping (for instance_mode)
         if instance_mode:
@@ -299,6 +353,8 @@ class CellMapDataset3D(Dataset):
             "min_crop_voxels": self.min_crop_voxels,
             "max_resolution_ratio": self.max_resolution_ratio,
             "skip_datasets": sorted(self.skip_datasets),
+            "include_datasets": sorted(self.include_datasets) if self.include_datasets else None,
+            "challenge_split": self.challenge_split,
         }, sort_keys=True)
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
@@ -338,6 +394,8 @@ class CellMapDataset3D(Dataset):
 
         datasets = sorted(os.listdir(self.data_root))
         for dataset_name in datasets:
+            if self.include_datasets is not None and dataset_name not in self.include_datasets:
+                continue
             if dataset_name in self.skip_datasets:
                 logger.info(f"Skipping dataset: {dataset_name}")
                 continue
@@ -382,6 +440,13 @@ class CellMapDataset3D(Dataset):
                 crop_dir = os.path.join(gt_base, crop_name)
                 if not os.path.isdir(crop_dir):
                     continue
+
+                # Challenge crop-level filtering: manifest uses numeric IDs
+                # (e.g., "234"), filesystem uses "crop234"
+                if self._challenge_crops is not None:
+                    crop_number = crop_name.removeprefix("crop")
+                    if (dataset_name, crop_number) not in self._challenge_crops:
+                        continue
 
                 crop_info = self._build_crop_info(
                     dataset_name, crop_name, crop_dir,
@@ -478,12 +543,16 @@ class CellMapDataset3D(Dataset):
             raw = 1.0 - raw
         return raw
 
-    def _extract_patch(self, crop: CropInfo):
+    def _extract_patch(self, crop: CropInfo, scale_factor: float = 1.0):
         """Extract a random 3D patch from a crop, resampled to isotropic target_resolution.
 
         All reads are done in world coordinates, then resampled to
         patch_size voxels at target_resolution. This correctly handles
         anisotropic raw/label resolutions.
+
+        When scale_factor > 1, a proportionally larger world volume is read
+        and downsampled to the same patch_size, giving the model a wider
+        field of view at coarser effective resolution.
 
         Returns:
             raw: np.ndarray [D, H, W] float32 in [0, 1]
@@ -492,20 +561,23 @@ class CellMapDataset3D(Dataset):
             spatial_mask: np.ndarray [D, H, W] float32 — 1 inside GT crop, 0 outside
         """
         D, H, W = self.patch_size
+        # Scale the world extent: scale_factor=2 reads 2x larger volume
+        patch_world = self.patch_world * scale_factor
+
         crop_origin = np.array(crop.crop_origin_world)
         crop_extent = np.array(crop.crop_extent_world)
         crop_end = crop_origin + crop_extent
         crop_center = crop_origin + crop_extent / 2
 
         # Whether the crop is smaller than the patch in any dimension
-        small_crop = np.any(crop_extent < self.patch_world)
+        small_crop = np.any(crop_extent < patch_world)
 
         if small_crop:
             # Center the patch on the crop so raw EM context surrounds the GT
-            sample_origin = crop_center - self.patch_world / 2
+            sample_origin = crop_center - patch_world / 2
         else:
             # Random origin within valid range
-            max_origin = crop_end - self.patch_world
+            max_origin = crop_end - patch_world
             sample_origin = np.array([
                 self.rng.uniform(crop_origin[i], max_origin[i])
                 for i in range(3)
@@ -517,7 +589,7 @@ class CellMapDataset3D(Dataset):
         raw_shape = np.array(crop.raw_shape)
 
         # How many raw voxels cover the target world extent per axis
-        raw_read_vox = np.ceil(self.patch_world / raw_res).astype(int)
+        raw_read_vox = np.ceil(patch_world / raw_res).astype(int)
 
         raw_start_vox = np.round((sample_origin - raw_off) / raw_res).astype(int)
         # Clamp so the full read window stays within the raw volume
@@ -554,12 +626,13 @@ class CellMapDataset3D(Dataset):
         # Compute which output voxels fall inside the annotated crop region.
         # The crop covers [crop_origin, crop_end) in world coords; we need
         # to map that to output-patch voxel coordinates [0..D, 0..H, 0..W].
-        target_res = self.target_resolution
+        # Effective voxel size = patch_world / patch_size (accounts for scale_factor)
+        effective_res = patch_world / self.patch_size
         crop_start_in_patch = np.maximum(
-            np.round((crop_origin - sample_origin) / target_res).astype(int), 0
+            np.round((crop_origin - sample_origin) / effective_res).astype(int), 0
         )
         crop_end_in_patch = np.minimum(
-            np.round((crop_end - sample_origin) / target_res).astype(int),
+            np.round((crop_end - sample_origin) / effective_res).astype(int),
             self.patch_size,
         )
 
@@ -591,7 +664,7 @@ class CellMapDataset3D(Dataset):
             cls_off = np.array(ci.offset_world)
 
             # How many class voxels cover the target world extent
-            cls_patch_vox = np.ceil(self.patch_world / cls_res).astype(int)
+            cls_patch_vox = np.ceil(patch_world / cls_res).astype(int)
             cls_patch_vox = np.maximum(cls_patch_vox, 1)
 
             cls_start_vox = np.round((sample_origin - cls_off) / cls_res).astype(int)
@@ -682,8 +755,8 @@ class CellMapDataset3D(Dataset):
                 instance_annotated[inst_idx] = True
 
         if self.instance_mode:
-            return raw_patch, labels, annotated_mask, spatial_mask, instance_ids, instance_annotated
-        return raw_patch, labels, annotated_mask, spatial_mask
+            return raw_patch, labels, annotated_mask, spatial_mask, scale_factor, instance_ids, instance_annotated
+        return raw_patch, labels, annotated_mask, spatial_mask, scale_factor
 
     # ------------------------------------------------------------------
     # Instance target generation
@@ -800,6 +873,7 @@ class CellMapDataset3D(Dataset):
             annotated_mask: torch.Tensor [n_classes] bool — which classes annotated
             spatial_mask: torch.Tensor [1, D, H, W] float32 — 1 inside GT crop
             crop_name: str, e.g. "jrc_hela-2/crop1"
+            scale_factor: float — effective scale (1.0 = native resolution)
 
         When instance_mode=True, additionally returns:
             center_targets: torch.Tensor [1, D, H, W] float32 — center heatmap
@@ -812,12 +886,17 @@ class CellMapDataset3D(Dataset):
         else:
             crop = self.crops[self.rng.integers(len(self.crops))]
 
+        # Pick a random scale factor for multi-scale training
+        scale_factor = float(self.rng.choice(self.scale_factors))
+
         if self.instance_mode:
-            raw, labels, annotated_mask, spatial_mask, instance_ids, instance_annotated = (
-                self._extract_patch(crop)
+            raw, labels, annotated_mask, spatial_mask, scale_factor, instance_ids, instance_annotated = (
+                self._extract_patch(crop, scale_factor=scale_factor)
             )
         else:
-            raw, labels, annotated_mask, spatial_mask = self._extract_patch(crop)
+            raw, labels, annotated_mask, spatial_mask, scale_factor = (
+                self._extract_patch(crop, scale_factor=scale_factor)
+            )
 
         raw = torch.from_numpy(raw[np.newaxis])  # [1, D, H, W]
         labels = torch.from_numpy(labels)
@@ -853,10 +932,11 @@ class CellMapDataset3D(Dataset):
             foreground_t = torch.from_numpy(foreground[np.newaxis])    # [1, D, H, W]
             return (
                 raw, labels, annotated_mask, spatial_mask, crop_name,
+                scale_factor,
                 center_t, offsets_t, boundary_t, foreground_t,
             )
 
-        return raw, labels, annotated_mask, spatial_mask, crop_name
+        return raw, labels, annotated_mask, spatial_mask, crop_name, scale_factor
 
     # ------------------------------------------------------------------
     # Utilities

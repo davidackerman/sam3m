@@ -49,9 +49,10 @@ class LoRALinear(nn.Module):
 
         in_features = original_linear.in_features
         out_features = original_linear.out_features
+        device = original_linear.weight.device
 
-        self.lora_A = nn.Linear(in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.lora_A = nn.Linear(in_features, rank, bias=False, device=device)
+        self.lora_B = nn.Linear(rank, out_features, bias=False, device=device)
         self.scaling = alpha / rank
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 

@@ -6,7 +6,7 @@ Handles:
 - Gradient accumulation for effective larger batches
 - Per-class Dice validation
 - Checkpoint saving/loading (LoRA params + head only)
-- WandB / TensorBoard logging
+- TensorBoard logging
 """
 
 from __future__ import annotations
@@ -22,7 +22,23 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
+import torchvision.utils as vutils
+
 logger = logging.getLogger(__name__)
+
+# Classes to visualize (common, visually distinct organelles)
+_VIS_CLASSES = ["mito", "er", "nuc", "golgi", "ld", "lyso", "ves", "endo"]
+# Fixed colors per visualized class (RGB 0-1)
+_VIS_COLORS = [
+    (1.0, 0.0, 0.0),    # mito — red
+    (0.0, 1.0, 0.0),    # er — green
+    (0.0, 0.4, 1.0),    # nuc — blue
+    (1.0, 1.0, 0.0),    # golgi — yellow
+    (1.0, 0.5, 0.0),    # ld — orange
+    (0.8, 0.0, 1.0),    # lyso — purple
+    (0.0, 1.0, 1.0),    # ves — cyan
+    (1.0, 0.4, 0.7),    # endo — pink
+]
 
 
 class ZConsistencyLoss(nn.Module):
@@ -88,6 +104,8 @@ class CellMapTrainer:
         train_loader: DataLoader = None,
         val_loader: DataLoader = None,
         config: Dict = None,
+        tb_writer=None,
+        log_every_n_steps: int = 10,
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -96,6 +114,9 @@ class CellMapTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config or {}
+        self.tb_writer = tb_writer
+        self.log_every_n_steps = log_every_n_steps
+        self.log_images_every_n_steps = self.config.get("log_images_every_n_steps", 50)
 
         self.device = next(model.parameters()).device
         self.use_amp = self.config.get("use_amp", True)
@@ -113,6 +134,71 @@ class CellMapTrainer:
         self.checkpoint_dir = self.config.get("checkpoint_dir", "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
+        # Resolve visualization class indices
+        from sam3m.data.dataset import EVALUATED_CLASSES
+        self._vis_indices = []
+        self._vis_colors = []
+        for cls_name, color in zip(_VIS_CLASSES, _VIS_COLORS):
+            if cls_name in EVALUATED_CLASSES:
+                self._vis_indices.append(EVALUATED_CLASSES.index(cls_name))
+                self._vis_colors.append(color)
+
+    @torch.no_grad()
+    def _log_sample_images(
+        self,
+        tag: str,
+        image: torch.Tensor,
+        labels: torch.Tensor,
+        logits: torch.Tensor,
+        step: int,
+    ):
+        """Log a side-by-side [raw | GT | prediction] image to TensorBoard.
+
+        Args:
+            tag: TensorBoard tag prefix ("train" or "val").
+            image: [3, H, W] input image (RGB, 0-1 range).
+            labels: [C, Hm, Wm] ground truth binary masks.
+            logits: [C, Hm, Wm] predicted logits.
+            step: TensorBoard step.
+        """
+        if self.tb_writer is None or not self._vis_indices:
+            return
+
+        H, W = labels.shape[-2:]
+
+        # Raw grayscale → [3, H, W]
+        raw = F.interpolate(
+            image.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
+        ).squeeze(0).cpu().clamp(0, 1)
+
+        # Build color overlays for GT and prediction
+        gt_overlay = raw.clone()
+        pred_overlay = raw.clone()
+        probs = torch.sigmoid(logits).cpu()
+        labels_cpu = labels.cpu().float()
+
+        alpha = 0.5
+        for idx, (r, g, b) in zip(self._vis_indices, self._vis_colors):
+            color = torch.tensor([r, g, b], dtype=torch.float32).view(3, 1, 1)
+
+            # GT overlay
+            gt_mask = labels_cpu[idx] > 0.5  # [H, W]
+            if gt_mask.any():
+                gt_overlay[:, gt_mask] = (
+                    (1 - alpha) * gt_overlay[:, gt_mask] + alpha * color.expand_as(gt_overlay[:, gt_mask])
+                )
+
+            # Prediction overlay
+            pred_mask = probs[idx] > 0.5
+            if pred_mask.any():
+                pred_overlay[:, pred_mask] = (
+                    (1 - alpha) * pred_overlay[:, pred_mask] + alpha * color.expand_as(pred_overlay[:, pred_mask])
+                )
+
+        # Stack as [3, 3, H, W] grid → single image
+        grid = vutils.make_grid([raw, gt_overlay, pred_overlay], nrow=3, padding=4)
+        self.tb_writer.add_image(f"{tag}/raw_gt_pred", grid, step)
+
     def train_epoch(self) -> Dict[str, float]:
         """Run one training epoch."""
         self.model.train()
@@ -122,8 +208,10 @@ class CellMapTrainer:
         progress = self.epoch / max(max_epochs, 1)
 
         self.optimizer.zero_grad()
+        last_batch = None
 
         for batch_idx, batch in enumerate(self.train_loader):
+            last_batch = batch
             loss, log_dict = self._train_step(batch, progress)
 
             # Scale loss for gradient accumulation
@@ -144,6 +232,40 @@ class CellMapTrainer:
                 self.optimizer.zero_grad()
                 self.global_step += 1
 
+                # Per-step TensorBoard logging
+                if (
+                    self.tb_writer is not None
+                    and self.global_step % self.log_every_n_steps == 0
+                ):
+                    for k, v in log_dict.items():
+                        self.tb_writer.add_scalar(f"train/{k}", v, self.global_step)
+                    self.tb_writer.add_scalar(
+                        "train/lr", self.optimizer.param_groups[0]["lr"], self.global_step
+                    )
+
+                # Mid-epoch image logging
+                if (
+                    self.tb_writer is not None
+                    and self.global_step % self.log_images_every_n_steps == 0
+                ):
+                    self.model.eval()
+                    imgs = batch["images"].squeeze(0).to(self.device)
+                    lbls = batch["labels"].squeeze(0).to(self.device)
+                    sf = batch.get("scale_factor")
+                    if sf is not None:
+                        sf = sf.to(self.device)
+                    mid = imgs.shape[0] // 2
+                    with torch.no_grad(), autocast(device_type="cuda", enabled=self.use_amp):
+                        step_out = self.model(
+                            imgs[mid].unsqueeze(0), target_size=lbls.shape[-2:],
+                            scale_factor=sf,
+                        )
+                    self._log_sample_images(
+                        "train", imgs[mid], lbls[mid],
+                        step_out["fine"].squeeze(0), self.global_step,
+                    )
+                    self.model.train()
+
             # Accumulate metrics
             for k, v in log_dict.items():
                 if k not in epoch_losses:
@@ -157,6 +279,33 @@ class CellMapTrainer:
 
         if self.scheduler is not None:
             self.scheduler.step()
+
+        # Epoch-level TensorBoard logging
+        if self.tb_writer is not None:
+            for k, v in epoch_losses.items():
+                self.tb_writer.add_scalar(f"train_epoch/{k}", v, self.epoch)
+            self.tb_writer.add_scalar(
+                "train_epoch/lr", self.optimizer.param_groups[0]["lr"], self.epoch
+            )
+
+            # Log training sample images (middle z-slice of last batch)
+            if last_batch is not None:
+                self.model.eval()
+                images = last_batch["images"].squeeze(0).to(self.device)
+                labels = last_batch["labels"].squeeze(0).to(self.device)
+                last_scale = last_batch.get("scale_factor")
+                if last_scale is not None:
+                    last_scale = last_scale.to(self.device)
+                mid = images.shape[0] // 2
+                with torch.no_grad(), autocast(device_type="cuda", enabled=self.use_amp):
+                    out = self.model(
+                        images[mid].unsqueeze(0), target_size=labels.shape[-2:],
+                        scale_factor=last_scale,
+                    )
+                self._log_sample_images(
+                    "train", images[mid], labels[mid], out["fine"].squeeze(0), self.epoch
+                )
+                self.model.train()
 
         self.epoch += 1
         return epoch_losses
@@ -179,6 +328,9 @@ class CellMapTrainer:
         labels = batch["labels"].squeeze(0).to(self.device)           # [T, C, Hm, Wm]
         annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)  # [C]
         spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)    # [T, 1, Hm, Wm]
+        scale_factor = batch.get("scale_factor")
+        if scale_factor is not None:
+            scale_factor = scale_factor.to(self.device)  # [B] -> scalar after squeeze
 
         T = images.shape[0]
         total_loss = torch.tensor(0.0, device=self.device)
@@ -189,7 +341,10 @@ class CellMapTrainer:
             # Process each z-slice through the model
             for t in range(T):
                 frame = images[t].unsqueeze(0)  # [1, 3, H, W]
-                outputs = self.model(frame, target_size=labels.shape[-2:])
+                outputs = self.model(
+                    frame, target_size=labels.shape[-2:],
+                    scale_factor=scale_factor,
+                )
 
                 # Per-slice loss (unsqueeze to add dummy depth dim for 5D loss)
                 slice_labels = labels[t].unsqueeze(0).unsqueeze(2)  # [1, C, 1, Hm, Wm]
@@ -244,17 +399,25 @@ class CellMapTrainer:
         dice_union = torch.zeros(n_classes, device=self.device)
         dice_count = torch.zeros(n_classes, device=self.device)
 
+        logged_val_image = False
+
         for batch in self.val_loader:
             images = batch["images"].squeeze(0).to(self.device)
             labels = batch["labels"].squeeze(0).to(self.device)
             annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)
             spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)
+            scale_factor = batch.get("scale_factor")
+            if scale_factor is not None:
+                scale_factor = scale_factor.to(self.device)
 
             T = images.shape[0]
 
             for t in range(T):
                 frame = images[t].unsqueeze(0)
-                outputs = self.model(frame, target_size=labels.shape[-2:])
+                outputs = self.model(
+                    frame, target_size=labels.shape[-2:],
+                    scale_factor=scale_factor,
+                )
                 probs = torch.sigmoid(outputs["fine"]).squeeze(0)  # [C, H, W]
 
                 pred_binary = (probs > 0.5).float()
@@ -273,6 +436,19 @@ class CellMapTrainer:
                         dice_union[c] += union
                         dice_count[c] += 1
 
+            # Log first val batch middle slice
+            if not logged_val_image and self.tb_writer is not None:
+                mid = T // 2
+                with autocast(device_type="cuda", enabled=self.use_amp):
+                    mid_out = self.model(
+                        images[mid].unsqueeze(0), target_size=labels.shape[-2:],
+                        scale_factor=scale_factor,
+                    )
+                self._log_sample_images(
+                    "val", images[mid], labels[mid], mid_out["fine"].squeeze(0), self.epoch
+                )
+                logged_val_image = True
+
         # Compute per-class dice
         metrics = {}
         valid_dice = []
@@ -284,6 +460,11 @@ class CellMapTrainer:
 
         if valid_dice:
             metrics["val_dice/mean"] = sum(valid_dice) / len(valid_dice)
+
+        # TensorBoard validation logging
+        if self.tb_writer is not None and metrics:
+            for k, v in metrics.items():
+                self.tb_writer.add_scalar(f"val/{k}", v, self.epoch)
 
         return metrics
 

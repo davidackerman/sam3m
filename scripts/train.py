@@ -5,6 +5,7 @@ Usage:
     pixi run train
     python scripts/train.py
     python scripts/train.py --config configs/train_video.yaml
+    python scripts/train.py --run-name my-experiment
 """
 
 from __future__ import annotations
@@ -12,17 +13,57 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
+from datetime import datetime
 
 import torch
 import yaml
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+
+def setup_run_dir(cfg: dict, run_name: str | None, config_path: str) -> str:
+    """Create a timestamped run directory and snapshot the config into it.
+
+    Directory layout::
+
+        <run_dir_base>/<run_name>/
+        ├── config.yaml      # full frozen config
+        ├── train.log        # file log
+        └── checkpoints/     # saved during training
+
+    Returns the absolute path to the run directory.
+    """
+    base = cfg.get("logging", {}).get("run_dir", "runs")
+    if run_name is None:
+        run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = os.path.join(base, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Checkpoints subdirectory
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Override checkpoint_dir so trainer saves inside the run dir
+    cfg.setdefault("training", {})["checkpoint_dir"] = ckpt_dir
+
+    # Snapshot full config
+    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+
+    # Copy original config file for reference
+    shutil.copy2(config_path, os.path.join(run_dir, "original_config.yaml"))
+
+    # Add file handler to root logger
+    fh = logging.FileHandler(os.path.join(run_dir, "train.log"))
+    fh.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(fh)
+
+    return run_dir
 
 
 def main():
@@ -32,12 +73,19 @@ def main():
         help="Path to training config YAML",
     )
     parser.add_argument("--resume", default=None, help="Checkpoint to resume from")
+    parser.add_argument(
+        "--run-name", default=None,
+        help="Name for this run (default: YYYY-MM-DD_HH-MM-SS)",
+    )
     args = parser.parse_args()
 
     # Load config
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    # Set up run directory (config snapshot, file logging, checkpoint dir)
+    run_dir = setup_run_dir(cfg, args.run_name, args.config)
+    logger.info(f"Run directory: {run_dir}")
     logger.info(f"Loaded config from {args.config}")
 
     # ---- Data ----
@@ -48,6 +96,7 @@ def main():
     from sam3m.training.split import split_dataset
 
     data_cfg = cfg["data"]
+    scale_factors = data_cfg.get("scale_factors", [1])
     base_dataset = CellMapDataset3D(
         data_root=data_cfg["data_root"],
         norms_csv=data_cfg.get("norms_csv"),
@@ -55,6 +104,9 @@ def main():
         patch_size=tuple(data_cfg["patch_size"]),
         samples_per_epoch=data_cfg["samples_per_epoch"],
         skip_datasets=data_cfg.get("skip_datasets", []),
+        include_datasets=data_cfg.get("include_datasets"),
+        challenge_split=data_cfg.get("challenge_split"),
+        scale_factors=scale_factors,
     )
     logger.info(f"\n{base_dataset.summary()}")
 
@@ -112,6 +164,7 @@ def main():
     lora_cfg = model_cfg.get("lora", {})
     head_cfg = model_cfg.get("heads", {})
 
+    use_scale_conditioning = len(scale_factors) > 1
     model = build_cellmap_model(
         sam3_checkpoint=model_cfg.get("sam3_checkpoint"),
         lora_rank=lora_cfg.get("rank", 8),
@@ -122,6 +175,7 @@ def main():
         n_medium=head_cfg.get("n_medium", 17),
         n_coarse=head_cfg.get("n_coarse", 7),
         use_auxiliary=head_cfg.get("use_auxiliary", True),
+        use_scale_conditioning=use_scale_conditioning,
     )
 
     # ---- Loss ----
@@ -162,6 +216,13 @@ def main():
         eta_min=train_cfg.get("eta_min", 1e-6),
     )
 
+    # ---- TensorBoard ----
+    from torch.utils.tensorboard import SummaryWriter
+
+    log_cfg = cfg.get("logging", {})
+    tb_writer = SummaryWriter(log_dir=os.path.join(run_dir, "tensorboard"))
+    logger.info(f"TensorBoard logs: {tb_writer.log_dir}")
+
     # ---- Trainer ----
     from sam3m.training.trainer import CellMapTrainer
 
@@ -173,6 +234,8 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         config=train_cfg,
+        tb_writer=tb_writer,
+        log_every_n_steps=log_cfg.get("log_every_n_steps", 10),
     )
 
     if args.resume:
@@ -209,6 +272,8 @@ def main():
     # Final checkpoint
     trainer.save_checkpoint()
     logger.info("Training complete!")
+
+    tb_writer.close()
 
 
 if __name__ == "__main__":

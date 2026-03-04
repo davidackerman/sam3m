@@ -25,6 +25,12 @@ data:
   image_size: 1008
   mask_size: 256
   samples_per_epoch: 2000
+  scale_factors: [1, 2, 4]  # 8nm/16nm/32nm effective resolution
+  # Challenge data filtering:
+  #   challenge_split: "train" — only challenge training crops (22 datasets, ~250 crops)
+  #   challenge_split: "test"  — only challenge test crops (6 datasets, 16 crops)
+  #   challenge_split: null    — use all available data (includes internal datasets)
+  challenge_split: train
   skip_datasets:
     - jrc_c-elegans-P3_E5_D1_N2  # broken zarr
 
@@ -82,6 +88,5 @@ training:
   distributed_backend: nccl
 
 logging:
-  wandb_project: sam3m-cellmap
-  wandb_run_name: null  # auto-generated
-  log_every_n_steps: 10
+  run_dir: runs  # base directory; each run creates runs/<run_name>/
+  log_every_n_steps: 10  # TensorBoard scalar logging frequency (optimizer steps)

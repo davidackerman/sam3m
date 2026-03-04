@@ -31,11 +31,14 @@ sam3m/
 │   ├── training/       # Trainer loop, train/val split
 │   └── inference/      # Sliding window prediction, watershed postprocessing
 ├── configs/
-│   ├── train_video.yaml  # Training configuration
-│   └── norms.csv         # Per-dataset normalization parameters
+│   ├── train_video.yaml           # Training configuration
+│   ├── norms.csv                  # Per-dataset normalization parameters
+│   ├── challenge_train_crops.csv  # CellMap challenge training manifest (22 datasets, ~250 crops)
+│   └── challenge_test_crops.csv   # CellMap challenge test manifest (6 datasets, 16 crops)
 ├── scripts/
 │   ├── train.py          # Training entry point
 │   └── smoke_test.py     # End-to-end pipeline verification
+├── runs/                 # Auto-created: timestamped run dirs (config, logs, checkpoints, TensorBoard)
 └── knowledge/            # Architecture docs and known gotchas
 ```
 
@@ -59,19 +62,70 @@ Input: [B, 3, 1008, 1008] (grayscale EM repeated to RGB)
 
 ## Data
 
-Uses the CellMap challenge data at `/nrs/cellmap/data/` (~289 annotated 3D FIB-SEM volumes, 48 organelle classes across ~22 datasets). The data pipeline:
+Uses the CellMap challenge data at `/nrs/cellmap/data/` (48 organelle classes across 22 datasets). The data pipeline:
 
 1. **CellMapDataset3D** extracts 128³ patches from zarr volumes, resampled to 8nm isotropic
 2. **CellMapVideoDataset** converts patches to 16-frame pseudo-videos (z-slices at stride 8, resized to 1008×1008)
 3. **ClassBalancedSampler** ensures rare classes get sufficient training signal
+4. **Multi-scale training** (optional) — randomly varies the effective resolution per sample, with FiLM conditioning on the segmentation head
+
+### Dataset filtering
+
+By default, training uses only the official CellMap challenge training crops (`challenge_split: train` in config). This is controlled in `configs/train_video.yaml`:
+
+```yaml
+# Only challenge training crops (default)
+challenge_split: train
+
+# All available data (includes internal non-challenge datasets)
+challenge_split: null
+
+# Manual allowlist (independent of challenge manifests)
+include_datasets:
+  - jrc_hela-2
+  - jrc_hela-3
+```
+
+Crop manifests are sourced from [janelia-cellmap/cellmap-segmentation-challenge](https://github.com/janelia-cellmap/cellmap-segmentation-challenge). Discovery results are cached per config, so the first run walks the filesystem but subsequent starts are instant.
+
+### Multi-scale training
+
+By default, patches are extracted at 8nm resolution (`scale_factors: [1]`). Enabling multi-scale training reads proportionally larger world volumes at the same 128³ voxel output, giving the model different effective resolutions:
+
+```yaml
+# configs/train_video.yaml
+scale_factors: [1, 2, 4]  # 8nm, 16nm, 32nm effective resolution
+```
+
+The scale factor is **explicitly passed to the model** (not predicted) via FiLM conditioning on the segmentation head. This lets the model learn scale-aware features — e.g., a large blob at 32nm is more likely a nucleus than a mitochondrion. At inference time, the scale factor is also passed explicitly based on the resolution being predicted at.
+
+When `scale_factors: [1]` (default), the FiLM layer is not created and there is zero overhead.
 
 ## Training
 
 ```bash
 pixi run train
-# or with custom config:
-pixi run python scripts/train.py --config configs/train_video.yaml
+# or with a specific config / run name:
+pixi run train --config configs/train_video.yaml
+pixi run train --run-name lora-r8-lr2e4
+# resume from checkpoint:
+pixi run train --resume runs/2026-03-03_14-30-00/checkpoints/checkpoint_epoch50.pt
 ```
+
+Each run creates a timestamped directory under `runs/`:
+
+```
+runs/2026-03-03_14-30-00/
+├── config.yaml           # frozen config snapshot (use to reproduce)
+├── original_config.yaml  # copy of the original YAML
+├── train.log             # full training log
+├── tensorboard/          # loss curves, LR, per-class Dice
+└── checkpoints/
+    ├── checkpoint_epoch10.pt
+    └── best.pt
+```
+
+View training curves: `tensorboard --logdir runs/`
 
 Key settings (see `configs/train_video.yaml`):
 - Batch size 1 per GPU, gradient accumulation 8

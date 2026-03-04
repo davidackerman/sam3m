@@ -25,6 +25,7 @@ psutil = "*"
 
 [tasks]
 train = "python scripts/train.py"
+train-ddp = "torchrun --nproc_per_node=8 scripts/train.py"
 evaluate = "python scripts/evaluate.py"
 test = "pytest tests/ -v"
 prepare-data = "python scripts/prepare_data.py"

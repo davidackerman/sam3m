@@ -4,7 +4,7 @@
 model:
   sam3_checkpoint: null  # uses default SAM3 checkpoint (requires HF auth)
   lora:
-    rank: 8
+    rank: 16
     alpha: 8.0
     dropout: 0.05
     targets: ["attn.qkv", "attn.proj"]
@@ -20,11 +20,10 @@ data:
   norms_csv: configs/norms.csv
   target_resolution: 8.0  # nm
   patch_size: [128, 128, 128]
-  num_frames: 16
-  frame_stride: 8
+  num_frames: 48
   image_size: 1008
-  mask_size: 256
-  samples_per_epoch: 2000
+  mask_size: 288  # matches pixel decoder output resolution
+  samples_per_epoch: 250
   scale_factors: [1, 2, 4]  # 8nm/16nm/32nm effective resolution
   # Challenge data filtering:
   #   challenge_split: "train" — only challenge training crops (22 datasets, ~250 crops)
@@ -43,9 +42,10 @@ augmentation:
 
 training:
   batch_size: 1  # per GPU (16 frames x 1008x1008 is memory-heavy)
-  num_workers: 8
-  prefetch_factor: 4
-  lr: 2.0e-4  # higher for LoRA (fewer params)
+  #num_workers: 8
+  #prefetch_factor: 4
+  lr: 2.0e-4      # LoRA learning rate
+  head_lr: 1.0e-3  # head learning rate (randomly initialized, needs higher LR)
   weight_decay: 0.01
   max_epochs: 200
   balanced_sampling: true
@@ -63,7 +63,7 @@ training:
 
   # Mixed precision & gradient accumulation
   use_amp: true
-  accumulation_steps: 8  # effective batch = batch_size * num_gpus * accumulation
+  accumulation_steps: 4  # effective batch = batch_size * num_gpus * accumulation
 
   # Loss
   loss:
@@ -76,11 +76,11 @@ training:
 
   # Validation
   val_fraction: 0.1
-  val_every_n_epochs: 5
+  val_every_n_epochs: 10
 
   # Checkpointing
-  checkpoint_dir: checkpoints/video_lora
-  save_every_n_epochs: 10
+  checkpoint_dir: checkpoints/lora
+  save_every_n_epochs: 25
   early_stopping_patience: 50
 
   # Multi-GPU

@@ -19,7 +19,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -99,9 +99,10 @@ class CellMapTrainer:
 
         self.device = next(model.parameters()).device
         self.use_amp = self.config.get("use_amp", True)
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
         self.accumulation_steps = self.config.get("accumulation_steps", 8)
-        self.z_consistency_weight = self.config.get("z_consistency_weight", 0.1)
+        loss_cfg = self.config.get("loss", {})
+        self.z_consistency_weight = loss_cfg.get("z_consistency_weight", 0.1)
         self.z_consistency_loss = ZConsistencyLoss()
 
         self.global_step = 0
@@ -172,10 +173,12 @@ class CellMapTrainer:
         Returns:
             (total_loss, log_dict)
         """
-        images = batch["images"].to(self.device)          # [T, 3, H, W]
-        labels = batch["labels"].to(self.device)           # [T, C, Hm, Wm]
-        annotated_mask = batch["annotated_mask"].to(self.device)  # [C]
-        spatial_masks = batch["spatial_masks"].to(self.device)    # [T, 1, Hm, Wm]
+        # DataLoader adds batch dim: [B, T, ...] -> squeeze to [T, ...]
+        # since we use batch_size=1 and process frames individually
+        images = batch["images"].squeeze(0).to(self.device)          # [T, 3, H, W]
+        labels = batch["labels"].squeeze(0).to(self.device)           # [T, C, Hm, Wm]
+        annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)  # [C]
+        spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)    # [T, 1, Hm, Wm]
 
         T = images.shape[0]
         total_loss = torch.tensor(0.0, device=self.device)
@@ -242,10 +245,10 @@ class CellMapTrainer:
         dice_count = torch.zeros(n_classes, device=self.device)
 
         for batch in self.val_loader:
-            images = batch["images"].to(self.device)
-            labels = batch["labels"].to(self.device)
-            annotated_mask = batch["annotated_mask"].to(self.device)
-            spatial_masks = batch["spatial_masks"].to(self.device)
+            images = batch["images"].squeeze(0).to(self.device)
+            labels = batch["labels"].squeeze(0).to(self.device)
+            annotated_mask = batch["annotated_mask"].squeeze(0).to(self.device)
+            spatial_masks = batch["spatial_masks"].squeeze(0).to(self.device)
 
             T = images.shape[0]
 
@@ -286,7 +289,7 @@ class CellMapTrainer:
 
     def save_checkpoint(self, path: Optional[str] = None, is_best: bool = False):
         """Save checkpoint with LoRA params + head weights only."""
-        from .lora import lora_state_dict
+        from sam3m.model.lora import lora_state_dict
 
         if path is None:
             path = os.path.join(

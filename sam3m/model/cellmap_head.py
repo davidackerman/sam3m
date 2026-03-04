@@ -6,9 +6,9 @@ since it is entirely new — SAM3 has no pre-existing 48-class dense head.
 
 Architecture:
     pixel_features [B, 256, H/4, W/4] (from SAM3's PixelDecoder)
+    -> Conv3x3(256, 256) + GroupNorm + GELU   (local spatial context)
     -> Conv1x1(256, 256) + GroupNorm + GELU
-    -> Conv1x1(256, 128) + GroupNorm + GELU
-    -> Conv1x1(128, n_fine) (48 classes)
+    -> Conv1x1(256, n_fine) (48 classes)
     -> Upsample 4x to full resolution (bilinear)
     -> sigmoid (during inference)
 
@@ -108,28 +108,28 @@ class CellMapSegmentationHead(nn.Module):
 
         # Main fine-level head
         self.fine_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),  # 3x3 for spatial context
+            nn.GroupNorm(32, in_channels),
+            nn.GELU(),
             nn.Conv2d(in_channels, in_channels, 1),
             nn.GroupNorm(32, in_channels),
             nn.GELU(),
-            nn.Conv2d(in_channels, hidden_channels, 1),
-            nn.GroupNorm(16, hidden_channels),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, n_fine, 1),
+            nn.Conv2d(in_channels, n_fine, 1),
         )
 
         # Auxiliary heads for hierarchical loss (medium + coarse)
         if use_auxiliary:
             self.medium_head = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels, 1),
+                nn.GroupNorm(32, in_channels),
+                nn.GELU(),
+                nn.Conv2d(in_channels, n_medium, 1),
+            )
+            self.coarse_head = nn.Sequential(
                 nn.Conv2d(in_channels, hidden_channels, 1),
                 nn.GroupNorm(16, hidden_channels),
                 nn.GELU(),
-                nn.Conv2d(hidden_channels, n_medium, 1),
-            )
-            self.coarse_head = nn.Sequential(
-                nn.Conv2d(in_channels, hidden_channels // 2, 1),
-                nn.GroupNorm(8, hidden_channels // 2),
-                nn.GELU(),
-                nn.Conv2d(hidden_channels // 2, n_coarse, 1),
+                nn.Conv2d(hidden_channels, n_coarse, 1),
             )
 
         self._init_weights()

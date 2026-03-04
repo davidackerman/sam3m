@@ -1,7 +1,7 @@
 """SAM3 + LoRA + CellMap head assembly.
 
 Builds the full model for CellMap fine-tuning:
-1. Load pre-trained SAM3 (image or video mode)
+1. Load pre-trained SAM3
 2. Freeze all parameters
 3. Apply LoRA to vision encoder attention layers
 4. Attach CellMapSegmentationHead (fully trainable)
@@ -41,6 +41,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from torchvision.transforms import v2
 
 from .cellmap_head import CellMapSegmentationHead
 from .lora import apply_lora, freeze_except_lora, count_parameters
@@ -85,6 +86,10 @@ class SAM3CellMapModel(nn.Module):
         #   "backbone_fpn": list of 3 feature maps [B, 256, 288/144/72, ...]
         #   "vision_features": [B, 256, 72, 72] (lowest-res)
         #   "vision_pos_enc": list of 3 positional encodings
+        # Match Sam3Processor normalization: [0, 1] -> [-1, 1]
+        images = v2.functional.normalize(
+            images, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+        )
         backbone_out = self.sam3.backbone.forward_image(images)
         backbone_fpn = backbone_out["backbone_fpn"]
 

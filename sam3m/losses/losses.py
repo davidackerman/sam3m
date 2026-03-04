@@ -80,7 +80,7 @@ class MaskedBCELoss(nn.Module):
         bce = bce * combined
 
         if self.class_weights is not None:
-            w = self.class_weights.view(1, -1, 1, 1, 1)
+            w = self.class_weights.reshape(1, -1, 1, 1, 1)
             bce = bce * w
 
         n_annotated_voxels = combined.sum()
@@ -121,8 +121,8 @@ class MaskedDiceLoss(nn.Module):
         probs_masked = probs * combined
         targets_masked = targets * combined
 
-        probs_flat = probs_masked.view(B, C, -1)
-        targets_flat = targets_masked.view(B, C, -1)
+        probs_flat = probs_masked.reshape(B, C, -1)
+        targets_flat = targets_masked.reshape(B, C, -1)
 
         intersection = (probs_flat * targets_flat).sum(dim=2)
         union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
@@ -263,9 +263,9 @@ class HierarchicalLoss(nn.Module):
         B = fine_labels.shape[0]
         spatial = fine_labels.shape[2:]
 
-        fine_flat = fine_labels.view(B, fine_labels.shape[1], -1)
+        fine_flat = fine_labels.reshape(B, fine_labels.shape[1], -1)
         group_flat = torch.einsum("gf,bfn->bgn", mapping, fine_flat)
-        group_labels = group_flat.clamp(0, 1).view(B, mapping.shape[0], *spatial)
+        group_labels = group_flat.clamp(0, 1).reshape(B, mapping.shape[0], *spatial)
 
         group_mask = torch.einsum("gf,bf->bg", mapping, fine_mask.float()) > 0
 
